@@ -1,0 +1,199 @@
+---
+title: "Data Pre-analysis 2"
+author: "Dave Edison Rojas Calderon"
+date: "2023-04-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Functions
+```{r}
+# For taxonomy assignation
+## Data wrangling
+### Prepare tables
+prepare_tax = function(data, run_number) {
+  data_modified = data %>% 
+    rowwise() %>% 
+    mutate(Assigned = sum(d__Bacteria, d__Eukaryota, d__Archaea)) %>% 
+    mutate(run = run_number) %>% 
+    pivot_longer(cols = c(Assigned, Unassigned),
+                 names_to = "Taxonomy assignation",
+                 values_to = "Count") %>% 
+    select("index", "run", "Taxonomy assignation", "Count")
+  return(data_modified)
+}
+
+prepare_to_merge = function(data, run_value) {
+data_prepared = data %>%
+  select("SampleID", "input", "filtered", "denoised", "merged", "non-chimeric") %>% 
+  pivot_longer(cols = -SampleID,
+               names_to = "denoising-step",
+               values_to = "count-reads") %>% 
+  mutate(run = run_value)
+return(data_prepared)
+}
+```
+
+# LOAD LIBRARIES
+```{r}
+library(qiime2R)
+library(tidyverse)
+library(gplots)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+# Load data
+Denoising statistics tables
+```{r}
+#Run 0
+deno_0_ire = read_q2metadata("../data/run_0/denoising-stats-ire.tsv")
+deno_0_nor1 = read_q2metadata("../data/run_0/denoising-stats-nor_1.tsv")
+deno_0_nor2 = read_q2metadata("../data/run_0/denoising-stats-nor_2.tsv")
+
+deno_min = rbind(deno_0_ire, deno_0_nor1, deno_0_nor2)
+
+# Run 2
+deno_2 = read_q2metadata("../data/atlanticsalmon-23032023-2/denoising-stats-atlanticsalmon-23032023-2.tsv")
+
+# Run 5
+deno_5 = read_q2metadata("../data/atlanticsalmon-23032023-5/denoising-stats-atlanticsalmon-23032023-12.tsv")
+
+# Run 12
+deno_12 = read_q2metadata("../data/denoising-stats-atlanticsalmon-23032023-12.tsv")
+
+# Run 15
+deno_15 = read_q2metadata("../data/denoising-stats-atlanticsalmon-23032023-15.tsv")
+
+# Run 20
+deno_20 = read_q2metadata("../data/denoising-stats-atlanticsalmon-23032023-20.tsv")
+
+# Run 25
+deno_25 = read_q2metadata("../data/denoising-stats-atlanticsalmon-25.tsv")
+
+# Run_JD
+deno_max = read_q2metadata("../data/salmon-max/denosing-salmon-max.tsv")
+
+# For taxonomy assignation boxplots
+## Run JD (trunc_len_f/r = 300/260, max_ee_f/r = 12/12)
+tax_jd = read.csv("../data/salmon-max/level-1-JD.csv")
+
+## Run max (trunc_len_f/r = 300/260, max_ee_f/r = 12/12)
+tax_max = read.csv("../data/salmon-max/level-1-max.csv")
+
+## Run 0 (trunc_len_f/r = 200/160, trim_left_f = 14/14, max_ee_f/r = 12/12)
+tax_0 = read.csv("../data/boxplot_tax_assignation/tax-level-1-0.csv")
+
+## Run 2 (trunc_len_f/r = 200/160, trim_left_f = 14/14, max_ee_f/r = 2/2)
+tax_2 = read.csv("../data/boxplot_tax_assignation/level-1-2.csv")
+
+## Run 5 (trunc_len_f/r = 200/160, trim_left_f = 14/14, max_ee_f/r = 5/5)
+tax_5 = read.csv("../data/boxplot_tax_assignation/level-1-5.csv")
+
+## Run 12 (trunc_len_f/r = 260/200, max_ee_f/r = 12/12)
+tax_12 = read.csv("../data/boxplot_tax_assignation/level-1-12.csv")
+
+## Run 15 (trunc_len_f/r = 260/200, max_ee_f/r = 15/15)
+tax_15 = read.csv("../data/boxplot_tax_assignation/level-1-15.csv")
+
+## Run 20 (trunc_len_f/r = 260/200, max_ee_f/r = 20/20)
+tax_20 = read.csv("../data/boxplot_tax_assignation/level-1-20.csv")
+
+## Run 25 (trunc_len_f/r = 260/200, max_ee_f/r = 25/25)
+tax_25 = read.csv("../data/boxplot_tax_assignation/tax-level-1-1.csv")
+```
+Data wrangling
+```{r}
+deno_max = prepare_to_merge(deno_max, "Max")
+deno_min = prepare_to_merge(deno_min, "Min")
+deno_2 = prepare_to_merge(deno_2, "2")
+deno_5 = prepare_to_merge(deno_5, "5")
+deno_12 = prepare_to_merge(deno_12, "12")
+deno_15 = prepare_to_merge(deno_15, "15")
+deno_20 = prepare_to_merge(deno_20, "20")
+deno_25 = prepare_to_merge(deno_25, "25")
+```
+Join tables
+```{r}
+all_deno = rbind(deno_min, deno_2, deno_5, deno_12, deno_15, deno_20, deno_25)
+```
+Join metadata
+```{r}
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv")
+
+all_deno = all_deno %>% 
+  left_join(metadata,
+            by = join_by(SampleID))
+```
+Order the levels of denoising-step before plotting
+```{r}
+all_deno$`denoising-step` = factor(all_deno$`denoising-step`, levels = c("input", "filtered", "denoised", "merged", "non-chimeric"))
+
+all_deno$run = factor(all_deno$run, levels = c("Min","2", "5", "12", "15", "20", "25"))
+```
+
+# Plot
+```{r}
+all_deno %>% 
+    ggplot(aes(x = `run`, y = `count-reads`, fill = `denoising-step`)) +
+    geom_bar(stat = "identity",
+             position=position_dodge()) +
+  labs(y = "Number of reads",
+       x = "Run",
+       fill = "Step") +
+  theme_bw()
+```
+Save image
+```{r}
+ggsave("../plots/denoising_steps.png", height = 5, width = 10)
+```
+
+
+## Details of runs
+- JD run: trunc_len_f/r: 300/260 and max_ee_f/r: 12/12
+- Other runs: trunc_len_f/r: 260/200
+
+# Comparison of taxonomy assignation between runs
+Data wrangling
+```{r}
+# Prepare tables
+tax_jd = prepare_tax(tax_jd, "run_jd")
+tax_max = prepare_tax(tax_max, "Max")
+tax_0 = prepare_tax(tax_0, "Min")
+tax_2 = prepare_tax(tax_2, "2")
+tax_5 = prepare_tax(tax_5, "5")
+tax_12 = prepare_tax(tax_12, "12")
+tax_15 = prepare_tax(tax_15, "15")
+tax_20 = prepare_tax(tax_20, "20")
+tax_25 = prepare_tax(tax_25, "25")
+
+# Join tables
+tax = tax_0 %>% 
+  rbind(tax_2, tax_5, tax_12, tax_15, tax_20, tax_25)
+```
+Order levels
+```{r}
+tax$run = factor(tax$run, levels = c("Min", "2", "5", "12", "15", "20", "25"))
+```
+
+## Plot boxplot
+```{r}
+tax %>% 
+  ggplot(aes(x = `Taxonomy assignation`,
+             y = Count)) +
+  geom_boxplot(aes(fill = `Taxonomy assignation`)) +
+  facet_grid(. ~ run) +
+  theme_bw() +
+  theme(axis.text.x = element_blank()) +
+  labs(y = "Number of ASVs",
+       x = "Run") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red")
+```
+Save plot
+```{r}
+ggsave("../plots/taxonomic_assignation.png", height = 5, width = 10)
+```
+
+

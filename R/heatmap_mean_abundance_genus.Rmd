@@ -1,0 +1,571 @@
+---
+title: "Heatmap"
+author: "Dave Edison Rojas Calderon"
+date: "2023-05-04"
+output: html_document
+---
+
+Functions
+```{r}
+filterTopN = function(RelAbTable, rel_abund_col, topN) {
+  
+  # Group by taxonomy and calculate the mean of relative abundance for each taxonomy
+  taxa_mean = RelAbTable %>%
+    replace(is.na(.), 0) %>% 
+    group_by(Taxonomy) %>%
+    summarise(rel_abund_mean = mean(!!sym(rel_abund_col))) %>%
+    ungroup()
+
+  # Arrange by descending order of relative abundance and select the top N taxonomies
+  top_taxa = taxa_mean %>%
+    arrange(desc(rel_abund_mean)) %>%
+    slice(1:topN)
+
+  # Filter out the top N taxonomies and sum the relative abundance of the remaining taxa
+  other_taxa = taxa_mean %>%
+    anti_join(top_taxa, by = "Taxonomy") %>%
+    summarise(Taxonomy = "Other") %>%
+    mutate(rel_abund_mean = mean(RelAbTable[[rel_abund_col]][Taxonomy == "Other"]))
+
+  # Combine the top N taxonomies and the "other" group
+  final_df = bind_rows(top_taxa, other_taxa)
+
+  # Join with original dataframe to get the sample indexes and time_points
+  FilteredRelAbTable = RelAbTable %>%
+    left_join(final_df, by = "Taxonomy") %>%
+    mutate(Taxonomy = ifelse(is.na(rel_abund_mean), "Other", Taxonomy))
+
+  return(FilteredRelAbTable)
+}
+```
+
+Loading packages
+```{r}
+# Load library
+library(qiime2R)
+library(tidyverse)
+library(gplots)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(janitor)
+library(patchwork)
+library(gridExtra)
+library(cowplot)
+library(ggpubr)
+```
+
+# DATA WRANGLING
+Open files
+```{r}
+# SVs
+SVs = read_qza(file = "../data/salmon-5/table-atlanticsalmon-5.qza")
+
+# Taxonomy assignations
+taxonomy = read_qza(file = "../data/salmon-5/tax-class-atlanticsalmon-5.qza")
+
+# Metadata
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv") %>% 
+  mutate(phase2 = phase) %>% 
+  mutate(WP2 = WP)
+
+metadata = metadata %>% 
+  mutate(SampleID = str_replace_all(SampleID, "-", ".")) %>% 
+  mutate(phase2 = str_replace(phase2, "C0", "Observation")) %>% 
+  mutate(phase2 = str_replace(phase2, "C1", "Intervention")) %>%
+  mutate(WP2 = str_replace(WP2, "6A", "Wild")) %>% 
+  mutate(WP2 = str_replace(WP2, "5A", "Farm")) %>% 
+  rename(sample = SampleID)
+
+meta = metadata %>% 
+  select(sample, phase, phase2, WP, WP2, sample_site, country, timepoint, sample_dim, type_sample)
+
+gc()
+```
+
+Transform SVs and Taxonomy into tables
+```{r}
+# SVs table
+SVs = SVs$data %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "Feature.ID")
+
+# Taxonomy table
+taxonomy = taxonomy$data %>% 
+  parse_taxonomy()
+
+# Add Unclassified if the row is empty
+taxonomy[is.na(taxonomy)] = ""
+taxonomy[taxonomy == "__"] = ""
+
+for (i in 1:nrow(taxonomy)){
+  if (taxonomy[i,7] != ""){
+    taxonomy$Species[i] = paste(taxonomy$Genus[i], taxonomy$Species[i], sep = " ")
+  } else if (taxonomy[i,2] == ""){
+    kingdom = paste("Unclassified", taxonomy[i,1], sep = " ")
+    taxonomy[i, 2:7] = kingdom
+  } else if (taxonomy[i,3] == ""){
+    phylum = paste("Unclassified", taxonomy[i,2], sep = " ")
+    taxonomy[i, 3:7] = phylum
+  } else if (taxonomy[i,4] == ""){
+    class = paste("Unclassified", taxonomy[i,3], sep = " ")
+    taxonomy[i, 4:7] = class
+  } else if (taxonomy[i,5] == ""){
+    order = paste("Unclassified", taxonomy[i,4], sep = " ")
+    taxonomy[i, 5:7] = order
+  } else if (taxonomy[i,6] == ""){
+    family = paste("Unclassified", taxonomy[i,5], sep = " ")
+    taxonomy[i, 6:7] = family
+  } else if (taxonomy[i,7] == ""){
+    taxonomy$Species[i] = paste("Unclassified ",taxonomy$Genus[i], sep = " ")
+  }
+}
+
+# Add previous taxonomy level when "unclassified
+# Iterate over each row of the dataframe
+for (i in 1:nrow(taxonomy)) {
+  # Iterate over each column of the row
+  for (j in 1:ncol(taxonomy)) {
+    # Check if the value is "uncultured"
+    if (taxonomy[i, j] == "uncultured") {
+      # Update the value with "uncultured" followed by the previous column value
+      taxonomy[i, j] <- paste0("uncultured ", taxonomy[i, j - 1])
+    }
+  }
+}
+
+
+# Remove Eukaryota
+taxonomy = taxonomy %>% 
+  filter(Kingdom != "d__Eukaryota")
+```
+
+Select genus from taxonomy
+```{r}
+genus = taxonomy %>% 
+  rownames_to_column(var = "Feature.ID") %>% 
+  select(Feature.ID, Genus) %>% 
+  right_join(SVs,
+              by = "Feature.ID") %>% 
+  select(!Feature.ID) %>% 
+  drop_na() %>%
+  group_by(Genus) %>% 
+  summarise_all(list(sum)) %>% 
+  pivot_longer(names_to = "sample",
+               values_to = "Count",
+               cols = -Genus) %>% 
+  dplyr::select("sample", everything()) %>% 
+  mutate(Genus = str_replace(Genus,
+                              "Unclassified Unassigned",
+                              "Unclassified"))
+```
+
+Join with metadata
+```{r}
+genus = genus %>% 
+  left_join(meta,
+            by = join_by(sample)) %>% 
+  rename(Taxonomy = Genus)
+```
+
+# Filter and group in "Other"
+Filter top 20 genla across all samples
+```{r}
+genus = genus %>%
+  mutate_all(~replace_na(., 0)) %>% 
+  group_by(sample) %>%
+  mutate(relab_samples = Count / sum(Count) * 100) %>% 
+  ungroup()
+
+genus_f = filterTopN(genus, "relab_samples", 24)
+
+genus_f = genus_f %>% 
+  mutate_all(~replace_na(., 0))
+
+genus_f %>% 
+  select(Taxonomy) %>% 
+  unique()
+
+genus_f %>%
+  select(Taxonomy, rel_abund_mean) %>%
+  unique() %>% 
+  arrange(rel_abund_mean)
+```
+
+Order levels in sample type (diminutive - shorter name), time point, and taxonomy
+```{r}
+genus_f$sample_dim = factor(genus_f$sample_dim, levels = c("Fertilised eggs", "Yolk sack larvae", "Fry", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Filet", "Biofilm",  "Inlet water", "Tank water", "Outlet water", "River water", "Upstream water to farm", "Seawater inside pen", "Seawater outside pen", "Feed freshwater", "Feed sea cage"))
+
+genus_f$timepoint= factor(genus_f$timepoint, levels = c("T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"))
+
+levels(genus_f$Taxonomy)
+```
+
+# Calculate relative abundance and mean of relative abundance
+Group data
+Mean relative abundance based on sample type
+```{r}
+# Group the data again by the same columns and calculate the mean
+mean_data = genus_f %>%
+  group_by(country, WP, WP2, phase, phase2, type_sample, Taxonomy) %>%
+  summarize(mean_relab = mean(relab_samples))
+
+mean_data %>% 
+  select(Taxonomy, mean_relab) %>% 
+  filter(Taxonomy == "Unclassified")
+```
+Mean relative abundance based on sample type
+```{r}
+# Group the data again by the same columns and calculate the mean
+mean_data_type = genus_f %>%
+  group_by(country, WP, WP2, phase, phase2, type_sample, sample_dim, Taxonomy) %>%
+  summarize(mean_relab = mean(relab_samples))
+```
+Mean relative abundance based on time-point
+```{r}
+# Group the data again by the same columns and calculate the mean
+mean_data_time = genus_f %>%
+  group_by(country, WP, WP2, phase, phase2, type_sample, timepoint, Taxonomy) %>%
+  summarize(mean_relab = mean(relab_samples))
+```
+
+Log tranform data
+```{r}
+# General
+norm_data = mean_data %>% 
+  mutate(NormAbundance = log10(mean_relab + 0.01)) %>% 
+  arrange(desc(NormAbundance))
+
+norm_data %>% 
+  ungroup() %>% 
+  select(Taxonomy) %>% 
+  unique()
+
+
+# Sample type
+norm_data_type = mean_data_type %>% 
+  mutate(NormAbundance = log10(mean_relab + 0.01)) %>% 
+  arrange(desc(NormAbundance))
+
+norm_data_type %>% 
+  ungroup() %>% 
+  select(Taxonomy) %>% 
+  unique()
+
+# Time point
+norm_data_time = mean_data_time %>% 
+  mutate(NormAbundance = log10(mean_relab + 0.01)) %>% 
+  arrange(desc(NormAbundance))
+
+norm_data_time %>% 
+  ungroup() %>% 
+  select(Taxonomy) %>% 
+  unique()
+```
+
+Order Taxa by normalized abundance
+```{r}
+# Get the order
+norm_data$Taxonomy = factor(norm_data$Taxonomy, levels = c("uncultured Blastocatellaceae",
+                                                           "Bifidobacterium",
+                                                           "CL500-29_marine_group",
+                                                           "Corynebacterium",
+                                                           "Cutibacterium",
+                                                           "hgcI_clade",
+                                                           "Mycobacterium",
+                                                           "Micrococcus",
+                                                           "Bradyrhizobium",
+                                                           "Clade_III",
+                                                           "Hyphomicrobium",
+                                                           "Methylobacterium-Methylorubrum",
+                                                           "Mitochondria",
+                                                           "Pseudorhodobacter",
+                                                           "Rickettsia",
+                                                           "Sphingomonas",
+                                                           "uncultured Methyloligellaceae",
+                                                           "Chloroplast",
+                                                           "Cyanobium_PCC-6307",
+                                                           "Synechococcus_CC9902",
+                                                           "Clostridium_sensu_stricto_1",
+                                                           "Clostridium_sensu_stricto_7",
+                                                           "Mycoplasma",
+                                                           "Peptostreptococcus",
+                                                           "Unclassified Ruminococcaceae",
+                                                           "Tepidimicrobium",
+                                                           "Terrisporobacter",
+                                                           "Wolbachia",
+                                                           "Saccharimonadales",
+                                                           "Other",
+                                                           "Unclassified"))
+
+norm_data_type$Taxonomy = factor(norm_data_type$Taxonomy, levels = c("uncultured Blastocatellaceae",
+                                                           "Bifidobacterium",
+                                                           "CL500-29_marine_group",
+                                                           "Corynebacterium",
+                                                           "Cutibacterium",
+                                                           "hgcI_clade",
+                                                           "Mycobacterium",
+                                                           "Micrococcus",
+                                                           "Bradyrhizobium",
+                                                           "Clade_III",
+                                                           "Hyphomicrobium",
+                                                           "Methylobacterium-Methylorubrum",
+                                                           "Mitochondria",
+                                                           "Pseudorhodobacter",
+                                                           "Rickettsia",
+                                                           "Sphingomonas",
+                                                           "uncultured Methyloligellaceae",
+                                                           "Chloroplast",
+                                                           "Cyanobium_PCC-6307",
+                                                           "Synechococcus_CC9902",
+                                                           "Clostridium_sensu_stricto_1",
+                                                           "Clostridium_sensu_stricto_7",
+                                                           "Mycoplasma",
+                                                           "Peptostreptococcus",
+                                                           "Unclassified Ruminococcaceae",
+                                                           "Tepidimicrobium",
+                                                           "Terrisporobacter",
+                                                           "Wolbachia",
+                                                           "Saccharimonadales",
+                                                           "Other",
+                                                           "Unclassified"))
+
+norm_data_time$Taxonomy = factor(norm_data_time$Taxonomy, levels = c("uncultured Blastocatellaceae",
+                                                           "Bifidobacterium",
+                                                           "CL500-29_marine_group",
+                                                           "Corynebacterium",
+                                                           "Cutibacterium",
+                                                           "hgcI_clade",
+                                                           "Mycobacterium",
+                                                           "Micrococcus",
+                                                           "Bradyrhizobium",
+                                                           "Clade_III",
+                                                           "Hyphomicrobium",
+                                                           "Methylobacterium-Methylorubrum",
+                                                           "Mitochondria",
+                                                           "Pseudorhodobacter",
+                                                           "Rickettsia",
+                                                           "Sphingomonas",
+                                                           "uncultured Methyloligellaceae",
+                                                           "Chloroplast",
+                                                           "Cyanobium_PCC-6307",
+                                                           "Synechococcus_CC9902",
+                                                           "Clostridium_sensu_stricto_1",
+                                                           "Clostridium_sensu_stricto_7",
+                                                           "Mycoplasma",
+                                                           "Peptostreptococcus",
+                                                           "Unclassified Ruminococcaceae",
+                                                           "Tepidimicrobium",
+                                                           "Terrisporobacter",
+                                                           "Wolbachia",
+                                                           "Saccharimonadales",
+                                                           "Other",
+                                                           "Unclassified"))
+```
+
+
+# PLOT HEATMAP
+## Ireland Sample type
+```{r}
+heat_ire_samp = norm_data_type %>% 
+  filter(country == "Ireland") %>% 
+  ggplot(aes(x = sample_dim,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  labs(y = "",
+       title = "A",
+       x = "Sample site",
+       fill = "log10(Relative abundance)") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  theme(text = element_text(size = 20)) +
+  facet_grid(cols = vars(WP2),
+             scales = "free")
+
+heat_ire_time = norm_data_time %>% 
+  filter(country == "Ireland") %>% 
+  ggplot(aes(x = timepoint,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y = "",
+       title = "B",
+       x = "Sample site",
+       fill = "log10(Relative abundance)") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  theme(text = element_text(size = 20)) +
+  facet_grid(cols = vars(WP2),
+             scales = "free")
+
+heat_ire = heat_ire_samp / heat_ire_time + plot_layout(guides = "collect")
+
+# Save
+ggsave("../plots/heatmap_genus/heat_ire.pdf", width = 15, height = 15)
+ggsave("../plots/heatmap_genus/heat_ire.png", width = 15, height = 15)
+```
+
+## Norway c0 WP5
+```{r}
+heat_nor_wp5_samp = norm_data_type %>% 
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>%
+  filter(WP == "5A") %>%
+  ggplot(aes(x = sample_dim,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "A") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_wp5_time = norm_data_time %>% 
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>% 
+  filter(WP == "5A") %>%
+  ggplot(aes(x = timepoint,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "B") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_c0 = heat_nor_wp5_samp / heat_nor_wp5_time + plot_layout(guides = "collect")
+
+# Save
+ggsave("../plots/heatmap_genus/heat_nor_c0.pdf", width = 15, height = 15)
+ggsave("../plots/heatmap_genus/heat_nor_c0.png", width = 15, height = 15)
+```
+
+## Norway C1
+```{r}
+heat_nor_c1_samp = norm_data_type %>% 
+  filter(country == "Norway") %>%
+  filter(WP == "5A") %>% 
+  filter(phase == "C1") %>% 
+  ggplot(aes(x = sample_dim,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  facet_grid(~country, scales="free_x") +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "A") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_c1_time = norm_data_time %>% 
+  filter(country == "Norway") %>%
+  filter(WP == "5A") %>% 
+  filter(phase == "C1") %>% 
+  ggplot(aes(x = timepoint,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  facet_grid(~country, scales="free_x") +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "B") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_c1 = heat_nor_c1_samp / heat_nor_c1_time + plot_layout(guides = "collect")
+
+# Save
+ggsave("../plots/heatmap_genus/heat_nor_c1.pdf", width = 15, height = 15)
+ggsave("../plots/heatmap_genus/heat_nor_c1.png", width = 15, height = 15)
+```
+
+## Norway c0 WP6
+```{r}
+heat_nor_wp6_samp = norm_data_type %>% 
+  filter(country == "Norway") %>%
+  filter(WP == "6A") %>%
+  ggplot(aes(x = sample_dim,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "A") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_wp6_time = norm_data_time %>% 
+  filter(country == "Norway") %>%
+  filter(WP == "6A") %>%
+  ggplot(aes(x = timepoint,
+             y = Taxonomy,
+             fill = NormAbundance)) +
+  geom_tile() +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y = "",
+       x = "Sample site",
+       fill = "log10(Relative abundance)",
+       title = "B") +
+  scale_fill_gradient2(low = "steelblue4",
+                       mid = "thistle2",
+                       high = "sienna2") +
+  facet_grid(cols = vars(type_sample),
+             scales = "free") +
+  theme(text = element_text(size = 20))
+
+heat_nor_wp6 = heat_nor_wp6_samp / heat_nor_wp6_time + plot_layout(guides = "collect")
+
+# Save
+ggsave("../plots/heatmap_genus/heat_nor_wp6.pdf", width = 15, height = 15)
+ggsave("../plots/heatmap_genus/heat_nor_wp6.png", width = 15, height = 15)
+```

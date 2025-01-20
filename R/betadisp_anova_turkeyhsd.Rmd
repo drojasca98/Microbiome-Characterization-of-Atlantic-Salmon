@@ -1,0 +1,511 @@
+---
+title: "Beta dispersion. anova and HSD"
+author: "Dave Edison Rojas Calderon"
+date: "2023-06-30"
+output: html_document
+---
+
+Load packages
+```{r}
+library(tidyverse)
+library(stringr)
+library(tidyr)
+library(fs)
+library(dplyr)
+library(ggplot2)
+library(Compositional)
+library(broom)  # devtools::install_github("tidymodels/broom")
+library(cowplot)
+library(janitor)
+library(qiime2R)
+library(factoextra)
+library(readxl)
+library(vegan)
+library(patchwork)
+```
+
+# FUNCTIONS
+# Turkey's Honest Significant Differences function
+```{r}
+TurkeyHSD_test = function(betadisper_output){
+  (mod.HSD <- TukeyHSD(betadisper_output))
+
+  comparisons = rownames(mod.HSD$group)
+
+  mod.HSD.df = mod.HSD$group %>% 
+    as_tibble()
+
+  row.names(mod.HSD.df) = comparisons
+
+  # Add significance column
+  mod.HSD.df = mod.HSD.df %>% 
+    rownames_to_column(var = "comparisons") %>% 
+    mutate(significance = "")
+
+  # Iterate over each row in the tibble
+  for (i in 1:nrow(mod.HSD.df)) {
+    if (mod.HSD.df$`p adj`[i] < 0.05) {
+      mod.HSD.df$significance[i] = "*"
+    } else if (mod.HSD.df$`p adj`[i] < 0.01) {
+      mod.HSD.df$significance[i] = "**"
+    } else if (mod.HSD.df$`p adj`[i] < 0.001) {
+      mod.HSD.df$significance[i] = "***"
+    }
+  }
+  
+  #mod.HSD.df = mod.HSD.df %>% 
+    #filter(`p adj` <= 0.05)
+  
+  return(mod.HSD.df)
+}
+```
+
+Load data
+```{r}
+# SVs
+SVs = read_qza(file = "../data/salmon-5/table-atlanticsalmon-5.qza")
+
+# Taxonomy assignations
+taxonomy = read_qza(file = "../data/salmon-5/tax-class-atlanticsalmon-5.qza")
+
+# Metadata
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv") %>% 
+  mutate(phase2 = phase) %>% 
+  mutate(WP2 = WP)
+
+metadata = metadata %>% 
+  mutate(SampleID = str_replace_all(SampleID, "-", ".")) %>% 
+  mutate(phase2 = str_replace(phase2, "C0", "Observation")) %>% 
+  mutate(phase2 = str_replace(phase2, "C1", "Intervention")) %>%
+  mutate(WP2 = str_replace(WP2, "6A", "Wild")) %>% 
+  mutate(WP2 = str_replace(WP2, "5A", "Farm")) %>% 
+  rename(sample = SampleID)
+
+meta = metadata %>% 
+  select(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)
+```
+Clean and transform into a table
+```{r}
+# SVs table
+SVs = SVs$data %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "Feature.ID")
+
+# Taxonomy table
+taxonomy = taxonomy$data %>% 
+  parse_taxonomy()
+
+# Add Unclassified if the row is empty
+taxonomy[is.na(taxonomy)] = ""
+taxonomy[taxonomy == "__"] = ""
+
+for (i in 1:nrow(taxonomy)){
+  if (taxonomy[i,7] != ""){
+    taxonomy$Species[i] <- paste(taxonomy$Genus[i], taxonomy$Species[i], sep = " ")
+  } else if (taxonomy[i,2] == ""){
+    kingdom <- paste("Unclassified", taxonomy[i,1], sep = " ")
+    taxonomy[i, 2:7] <- kingdom
+  } else if (taxonomy[i,3] == ""){
+    phylum <- paste("Unclassified", taxonomy[i,2], sep = " ")
+    taxonomy[i, 3:7] <- phylum
+  } else if (taxonomy[i,4] == ""){
+    class <- paste("Unclassified", taxonomy[i,3], sep = " ")
+    taxonomy[i, 4:7] <- class
+  } else if (taxonomy[i,5] == ""){
+    order <- paste("Unclassified", taxonomy[i,4], sep = " ")
+    taxonomy[i, 5:7] <- order
+  } else if (taxonomy[i,6] == ""){
+    family <- paste("Unclassified", taxonomy[i,5], sep = " ")
+    taxonomy[i, 6:7] <- family
+  } else if (taxonomy[i,7] == ""){
+    taxonomy$Species[i] <- paste("Unclassified ",taxonomy$Genus[i], sep = " ")
+  }
+}
+
+# Add previous taxonomy level when "unclassified
+# Iterate over each row of the dataframe
+for (i in 1:nrow(taxonomy)) {
+  # Iterate over each column of the row
+  for (j in 1:ncol(taxonomy)) {
+    # Check if the value is "uncultured"
+    if (taxonomy[i, j] == "uncultured") {
+      # Update the value with "uncultured" followed by the previous column value
+      taxonomy[i, j] <- paste0("uncultured ", taxonomy[i, j - 1])
+    }
+  }
+}
+
+# Remove Eukaryota
+taxonomy = taxonomy %>% 
+  filter(Kingdom != "d__Eukaryota")
+
+gc()
+```
+Keep Genus level and join SVs table, zero replacement
+```{r}
+count = taxonomy %>% 
+  rownames_to_column(var = "Feature.ID") %>% 
+  select(Feature.ID, Genus) %>% 
+  right_join(SVs,
+              by = "Feature.ID") %>% 
+  select(!Feature.ID) %>% 
+  drop_na() %>%
+  group_by(Genus) %>% 
+  summarise_all(list(sum))
+
+gc()
+```
+Transpose the table
+```{r}
+#  Save row names
+rownames = colnames(count)
+
+# Transpose
+count = t(count) %>% 
+  as_tibble()
+
+# First row to column names
+count = count %>% 
+  row_to_names(row_number = 1)
+
+# Add row names to transpose data
+row.names(count) = rownames[-1]
+
+# Row to column names
+count = count %>% 
+  rownames_to_column(var = "sample")
+```
+## Relative abundance
+Data wide to long
+```{r}
+rel_ab = count %>% 
+  pivot_longer(cols = !sample,
+               names_to = "Genus",
+               values_to = "count")
+```
+Calculate relative abundance
+```{r}
+rel_ab$count = as.numeric(as.character(rel_ab$count))
+
+rel_ab = rel_ab %>% 
+  group_by(sample) %>% 
+  mutate(rel_ab = count / sum(count)) %>% 
+  ungroup()
+```
+Pivot longer to wide
+```{r}
+rel_ab = rel_ab %>% 
+  select(!count) %>% 
+  pivot_wider(names_from = Genus,
+              values_from = rel_ab) %>% 
+  drop_na()
+```
+
+Join metadata to count table (General table)
+```{r}
+relab_meta = rel_ab %>% 
+  left_join(meta,
+            by = "sample") %>% 
+  drop_na()
+
+countries = relab_meta$country
+sample_group = relab_meta$sample_group
+```
+
+Sub-tables for beta dispersion comparing
+```{r}
+# Ireland
+relab_ire = relab_meta %>% 
+  filter(country == "Ireland")
+### Only relative abundance
+only_relab_ire = relab_ire %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+wp_ire = relab_ire$WP
+
+## WP5
+relab_ire_wp5 = relab_ire %>% 
+  filter(WP == "5A")
+### Only relative abundance
+only_relab_ire_wp5 = relab_ire_wp5 %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+samp_ire_wp5 = relab_ire_wp5$sample_dim
+time_ire_wp5 = relab_ire_wp5$timepoint
+group_ire_wp5 = relab_ire_wp5$sample_group
+
+## WP6
+relab_ire_wp6 = relab_ire %>% 
+  filter(WP == "6A")
+### Only relative abundance
+only_relab_ire_wp6 = relab_ire_wp6 %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+samp_ire_wp6 = relab_ire_wp6$sample_dim
+time_ire_wp6 = relab_ire_wp6$timepoint
+group_ire_wp6 = relab_ire_wp6$sample_group
+
+# Norway
+relab_nor = relab_meta %>% 
+  filter(country == "Norway")
+### Only relative abundance
+only_relab_nor = relab_nor %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+wp_nor = relab_nor$WP
+phases_nor = relab_nor$phase
+
+## WP5
+relab_nor_wp5 = relab_nor %>% 
+  filter(WP == "5A")
+### Only relative abundance
+only_relab_nor_wp5 = relab_nor_wp5 %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+samp_nor_wp5 = relab_nor_wp5$sample_dim
+time_nor_wp5 = relab_nor_wp5$timepoint
+group_nor_wp5 = relab_nor_wp5$sample_group
+
+## WP6
+relab_nor_wp6 = relab_nor %>% 
+  filter(WP == "6A")
+### Only relative abundance
+only_relab_nor_wp6 = relab_nor_wp6 %>% 
+  select(-c(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)) %>% 
+  as.matrix()
+### save grouping
+samp_nor_wp6 = relab_nor_wp6$sample_dim
+time_nor_wp6 = relab_nor_wp6$timepoint
+group_nor_wp6 = relab_nor_wp6$sample_group
+```
+
+# Calculate Bray-Curtis dissimilarity
+General
+```{r}
+only_relab = rel_ab %>% 
+  select(!sample) %>% 
+  as.matrix()
+
+mode(only_relab) = "numeric"
+
+set.seed(123)
+
+dist = vegdist(only_relab, method = "bray")
+```
+Calculate for subgroups
+```{r}
+# Transform to numeric
+mode(only_relab_ire) = "numeric"
+mode(only_relab_ire_wp5) = "numeric"
+mode(only_relab_ire_wp6) = "numeric"
+mode(only_relab_nor) = "numeric"
+mode(only_relab_nor_wp5) = "numeric"
+mode(only_relab_nor_wp6) = "numeric"
+
+# Set sed
+set.seed(123)
+
+# Calculate Bray-Curtis dissimilarity
+dist_ire = vegdist(only_relab_ire, method = "bray")
+dist_ire_wp5 = vegdist(only_relab_ire_wp5, method = "bray")
+dist_ire_wp6 = vegdist(only_relab_ire_wp6, method = "bray")
+dist_nor = vegdist(only_relab_nor, method = "bray")
+dist_nor_wp5 = vegdist(only_relab_nor_wp5, method = "bray")
+dist_nor_wp6 = vegdist(only_relab_nor_wp6, method = "bray")
+```
+
+# Calculate Beta dispersion
+General
+```{r}
+mod = betadisper(dist, sample_group)
+mod_countries = betadisper(dist, countries)
+```
+Calculate for subgroups
+```{r}
+# Ireland
+## To compare WPs
+mod_ire_wps = betadisper(dist_ire, wp_ire)
+
+## WP5
+### Sample type
+mod_ire_wp5_samp = betadisper(dist_ire_wp5, samp_ire_wp5)
+### Time points
+mod_ire_wp5_time = betadisper(dist_ire_wp5, time_ire_wp5)
+### Sample Group
+mod_ire_wp5_group = betadisper(dist_ire_wp5, group_ire_wp5)
+
+## WP6
+### Sample type
+mod_ire_wp6_samp = betadisper(dist_ire_wp6, samp_ire_wp6)
+### Time points
+mod_ire_wp6_time = betadisper(dist_ire_wp6, time_ire_wp6)
+### Sample Group
+mod_ire_wp6_group = betadisper(dist_ire_wp6, group_ire_wp6)
+
+
+# Norway
+## To compare WPs
+mod_nor_wps = betadisper(dist_nor, wp_nor)
+## To compare Phases
+mod_nor_phases = betadisper(dist_nor, phases_nor)
+
+## WP5
+### Sample type
+mod_nor_wp5_samp = betadisper(dist_nor_wp5, samp_nor_wp5)
+### Time points
+mod_nor_wp5_time = betadisper(dist_nor_wp5, time_nor_wp5)
+### Sample Group
+mod_nor_wp5_group = betadisper(dist_nor_wp5, group_nor_wp5)
+
+## WP6
+### Sample type
+mod_nor_wp6_samp = betadisper(dist_nor_wp6, samp_nor_wp6)
+### Time points
+mod_nor_wp6_time = betadisper(dist_nor_wp6, time_nor_wp6)
+### Sample Group
+mod_nor_wp6_group = betadisper(dist_nor_wp6, group_nor_wp6)
+```
+Boxplots of beta dispersion
+General
+```{r}
+## GENERAL
+# Save plot
+png(file="../plots/boxplot_beta disper/ire_nor.png", width=400, height=300, res = 100)
+
+# Countries
+boxplot(mod_countries, xlab = "Country")
+
+dev.off()
+```
+Ireland
+```{r}
+## IRELAND
+# Save plot
+png(file="../plots/boxplot_beta disper/ire.png", width=700, height=700, res = 100)
+
+# Combine plots
+layout(matrix(c(1,1,2,3,4,5), 3, 2, byrow = TRUE))
+# Ireland WPs
+boxplot(mod_ire_wps, xlab = "Work package")
+
+# WP5 sample grouped and time points
+boxplot(mod_ire_wp5_group, xlab = "Sample type")
+boxplot(mod_ire_wp5_time, xlab = "Time point")
+
+# WP6 sample grouped and time points
+boxplot(mod_ire_wp6_group, xlab = "Sample type")
+boxplot(mod_ire_wp6_time, xlab = "Time point")
+
+dev.off()
+
+## NORWAY
+# Save plot
+png(file="../plots/boxplot_beta disper/nor.png", width=700, height=700, res = 100)
+
+# Combine plots
+layout(matrix(c(1,2,3,4,5,6), 3, 2, byrow = TRUE))
+
+# Norway WPs and phases
+boxplot(mod_nor_wps, xlab = "Work package")
+boxplot(mod_nor_phases, xlab = "Phases")
+
+# WP5 sample grouped and time points
+boxplot(mod_nor_wp5_group, xlab = "Sample type")
+boxplot(mod_nor_wp5_time, xlab = "Time point")
+
+# WP6 sample grouped and time points
+boxplot(mod_nor_wp6_group, xlab = "Sample type")
+boxplot(mod_nor_wp6_time, xlab = "Time point")
+
+dev.off()
+```
+
+# Perform test
+General
+```{r}
+anova(mod)
+anova(mod_countries)
+```
+For subgroups from Ireland
+```{r}
+print("Ireland comparing WPs")
+anova(mod_ire_wps)
+print("Ireland WP5 comparing sample type")
+anova(mod_ire_wp5_samp)
+print("Ireland WP5 comparing time-points")
+anova(mod_ire_wp5_time)
+print("Ireland WP5 comparing sample group")
+anova(mod_ire_wp5_group)
+print("Ireland WP6 comparing sample type")
+anova(mod_ire_wp6_samp)
+print("Ireland WP6 comparing time-point")
+anova(mod_ire_wp6_time)
+print("Ireland WP6 comparing sample group")
+anova(mod_ire_wp6_group)
+```
+
+For subgroups from Norway
+```{r}
+print("Norway comparing WPs")
+anova(mod_nor_wps)
+print("Norway comparing phases")
+anova(mod_nor_phases)
+print("Norway WP5 comparing sample type")
+anova(mod_nor_wp5_samp)
+print("Norway WP5 comparing time-points")
+anova(mod_nor_wp5_time)
+print("Norway WP5 comparing sample group")
+anova(mod_nor_wp5_group)
+print("Norway WP6 comparing sample type")
+anova(mod_nor_wp6_samp)
+print("Norway WP6 comparing time-points")
+anova(mod_nor_wp6_time)
+print("Norway WP5 comparing sample group")
+anova(mod_nor_wp6_group)
+```
+
+
+# Permutation test for F
+```{r}
+#permutest(mod, pairwise = TRUE, permutations = 99
+```
+
+# TurkeyHSD test
+General
+```{r}
+# Sample groups
+turkey_samp = TurkeyHSD_test(mod)
+write.csv(turkey_samp, "../turkey_samp.csv", row.names=FALSE)
+```
+For subgroups in Ireland
+```{r}
+TurkeyHSD_test(mod_ire_wp5_samp)
+
+TurkeyHSD_test(mod_ire_wp5_group)
+
+TurkeyHSD_test(mod_ire_wp6_samp)
+
+TurkeyHSD_test(mod_ire_wp6_time)
+
+TurkeyHSD_test(mod_ire_wp6_group)
+```
+For subgroups in Norway
+```{r}
+TurkeyHSD_test(mod_nor_wp5_samp)
+
+TurkeyHSD_test(mod_nor_wp5_time)
+
+TurkeyHSD_test(mod_nor_wp5_group)
+
+TurkeyHSD_test(mod_nor_wp6_samp)
+
+TurkeyHSD_test(mod_nor_wp6_group)
+```
+
+
+

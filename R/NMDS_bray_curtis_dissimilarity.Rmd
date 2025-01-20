@@ -1,0 +1,629 @@
+---
+title: "NMDS_based_on_abundance"
+author: "Dave Edison Rojas Calderon"
+date: "2023-04-16"
+output: html_document
+---
+
+Load libraries
+```{r}
+library(tidyverse)
+library(stringr)
+library(tidyr)
+library(fs)
+library(dplyr)
+library(ggplot2)
+library(Compositional)
+library(broom)  # devtools::install_github("tidymodels/broom")
+library(cowplot)
+library(janitor)
+library(qiime2R)
+library(factoextra)
+library(readxl)
+library(vegan)
+library(patchwork)
+```
+
+# DATA WRANGLING
+Open files
+```{r}
+# SVs
+SVs = read_qza(file = "../data/salmon-5/table-atlanticsalmon-5.qza")
+
+# Taxonomy assignations
+taxonomy = read_qza(file = "../data/salmon-5/tax-class-atlanticsalmon-5.qza")
+
+# Metadata
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv") %>% 
+  mutate(phase2 = phase) %>% 
+  mutate(WP2 = WP)
+
+metadata = metadata %>% 
+  mutate(SampleID = str_replace_all(SampleID, "-", ".")) %>% 
+  mutate(phase2 = str_replace(phase2, "C0", "Observation")) %>% 
+  mutate(phase2 = str_replace(phase2, "C1", "Intervention")) %>%
+  mutate(WP2 = str_replace(WP2, "6A", "Wild")) %>% 
+  mutate(WP2 = str_replace(WP2, "5A", "Farm")) %>% 
+  rename(sample = SampleID)
+
+meta = metadata %>% 
+  select(sample, phase, phase2, WP, WP2, sample_group, country, timepoint, sample_dim, type_sample)
+
+save(meta, file = "meta.Rda")
+```
+Transform into tables
+```{r}
+# SVs table
+SVs = SVs$data %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "Feature.ID")
+
+# Taxonomy table
+taxonomy = taxonomy$data %>% 
+  parse_taxonomy()
+
+# Add Unclassified if the row is empty
+taxonomy[is.na(taxonomy)] = ""
+taxonomy[taxonomy == "__"] = ""
+
+for (i in 1:nrow(taxonomy)){
+  if (taxonomy[i,7] != ""){
+    taxonomy$Species[i] <- paste(taxonomy$Genus[i], taxonomy$Species[i], sep = " ")
+  } else if (taxonomy[i,2] == ""){
+    kingdom <- paste("Unclassified", taxonomy[i,1], sep = " ")
+    taxonomy[i, 2:7] <- kingdom
+  } else if (taxonomy[i,3] == ""){
+    phylum <- paste("Unclassified", taxonomy[i,2], sep = " ")
+    taxonomy[i, 3:7] <- phylum
+  } else if (taxonomy[i,4] == ""){
+    class <- paste("Unclassified", taxonomy[i,3], sep = " ")
+    taxonomy[i, 4:7] <- class
+  } else if (taxonomy[i,5] == ""){
+    order <- paste("Unclassified", taxonomy[i,4], sep = " ")
+    taxonomy[i, 5:7] <- order
+  } else if (taxonomy[i,6] == ""){
+    family <- paste("Unclassified", taxonomy[i,5], sep = " ")
+    taxonomy[i, 6:7] <- family
+  } else if (taxonomy[i,7] == ""){
+    taxonomy$Species[i] <- paste("Unclassified ",taxonomy$Genus[i], sep = " ")
+  }
+}
+
+# Add previous taxonomy level when "unclassified
+# Iterate over each row of the dataframe
+for (i in 1:nrow(taxonomy)) {
+  # Iterate over each column of the row
+  for (j in 1:ncol(taxonomy)) {
+    # Check if the value is "uncultured"
+    if (taxonomy[i, j] == "uncultured") {
+      # Update the value with "uncultured" followed by the previous column value
+      taxonomy[i, j] <- paste0("uncultured ", taxonomy[i, j - 1])
+    }
+  }
+}
+
+# Remove Eukaryota
+taxonomy = taxonomy %>% 
+  filter(Kingdom != "d__Eukaryota")
+
+gc()
+```
+Check the unique values in each taxonomy level to decide which one will be used for the NMDS
+```{r}
+# Phylum
+taxonomy %>% 
+  select(Phylum) %>% 
+  unique()
+
+# Class
+taxonomy %>% 
+  select(Class) %>% 
+  unique()
+
+# Order
+taxonomy %>% 
+  select(Order) %>% 
+  unique()
+
+# Genus
+taxonomy %>% 
+  select(Genus) %>% 
+  unique()
+
+# Species
+taxonomy %>% 
+  select(Species) %>% 
+  unique()
+```
+Keep Genus level and join SVs table, zero replacement
+```{r}
+count_nmds = taxonomy %>% 
+  rownames_to_column(var = "Feature.ID") %>% 
+  select(Feature.ID, Genus) %>% 
+  right_join(SVs,
+              by = "Feature.ID") %>% 
+  select(!Feature.ID) %>% 
+  drop_na() %>%
+  group_by(Genus) %>% 
+  summarise_all(list(sum))
+
+gc()
+```
+Transpose the table
+```{r}
+#  Save row names
+rownames = colnames(count_nmds)
+
+# Transpose
+count_nmds = t(count_nmds) %>% 
+  as_tibble()
+
+# First row to column names
+count_nmds = count_nmds %>% 
+  row_to_names(row_number = 1)
+
+# Add row names to transpose data
+row.names(count_nmds) = rownames[-1]
+
+# Row to column names
+count_nmds = count_nmds %>% 
+  rownames_to_column(var = "sample")
+```
+## Relative abundance
+Data wide to long
+```{r}
+rel_ab = count_nmds %>% 
+  pivot_longer(cols = !sample,
+               names_to = "Genus",
+               values_to = "count")
+```
+Calculate relative abundance
+```{r}
+rel_ab$count = as.numeric(as.character(rel_ab$count))
+
+rel_ab = rel_ab %>% 
+  group_by(sample) %>% 
+  mutate(rel_ab = count / sum(count)) %>% 
+  ungroup()
+```
+Pivot longer to wide
+```{r}
+rel_ab = rel_ab %>% 
+  select(!count) %>% 
+  pivot_wider(names_from = Genus,
+              values_from = rel_ab) %>% 
+  drop_na()
+```
+
+# NMDS (Non-metric Multi-dimensional Scaling)
+Turn abundance data frame into a matrix
+```{r}
+m_com = rel_ab %>% 
+  select(!sample) %>% 
+  as.matrix()
+```
+Run metaMDS
+```{r}
+set.seed(123)
+nmds = metaMDS(m_com, distance = "bray")
+nmds
+```
+# First look
+Stress plot
+```{r}
+stressplot(nmds)
+```
+Basic plot
+```{r}
+plot(nmds)
+```
+Extract NMDS scores (x and y coordinates) for sites from newer versions of vegan package
+```{r}
+data.scores = as.data.frame(scores(nmds)$sites)
+```
+Join to metadata
+```{r}
+data.scores$sample = rel_ab$sample
+
+data.scores = data.scores %>% 
+  inner_join(meta,
+             by = "sample")
+
+data.scores %>% 
+  select(sample_group) %>% 
+  unique()
+```
+Assign levels to sample type
+```{r}
+data.scores$sample_dim = factor(data.scores$sample_dim, levels = c("Fertilised eggs", "Yolk sack larvae", "Fry", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Filet", "Biofilm freshwater",  "Inlet water", "Tank water", "Outlet water", "Biofilm", "River water", "Biofilm sea cage", "Upstream water to farm", "Seawater inside pen", "Seawater outside pen", "Feed freshwater", "Feed sea cage"))
+
+data.scores$sample_group = factor(data.scores$sample_group, levels = c("Early stages", "Skin", "Intestine", "Digesta", "Filet", "Biofilm",  "Fresh water", "Sea water", "River", "Feed"))
+```
+Assign levels to time point
+```{r}
+data.scores$timepoint= factor(data.scores$timepoint, levels = c("T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"))
+```
+
+
+# PLOT
+Colors
+```{r}
+my_colors = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+             "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+             "#ff9896", "#98df8a", "#f7b6d2", "#c5b0d5", "#c7c7c7",
+             "#dbdb8d", "#9edae5", "#aec7e8")
+```
+## GENERAL FOR DISCUSSION
+```{r}
+# Rename sample group
+data.scores = data.scores %>% 
+  mutate(`Sample type` = sample_group)
+
+nmds_general = data.scores %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = `Sample type`)) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16),
+                     name="Source") +
+  labs(title = "",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))+
+  stat_ellipse(geom = "polygon",
+               aes(fill = `Sample type`), 
+               alpha = 0.25)
+
+ggsave("../plots/nmds_grouped/nmds_general.pdf", width = 12, height = 10)
+ggsave("../plots/nmds_grouped/nmds_general.png", width = 12, height = 10) 
+```
+
+## Ireland WP5
+```{r}
+ire_wp5_bray_samp = data.scores %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "5A") %>%
+  filter(phase == "C0") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = sample_group,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Sample type") +
+  labs(title = "A",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))+
+  stat_ellipse()
+
+ire_wp5_bray_time = data.scores %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "5A") %>%
+  filter(phase == "C0") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = timepoint,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Time point") +
+  labs(title = "A",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))
+
+ire_wp5_bray = ire_wp5_bray_samp / ire_wp5_bray_time
+
+ggsave("../plots/nmds_grouped/ire_bray_wp5.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/ire_bray_wp5.png", width = 10, height = 12)    
+```
+## Ireland WP6
+```{r}
+ire_wp6_bray_samp = data.scores %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "6A") %>%
+  filter(phase == "C0") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = sample_group)) +
+  geom_point(alpha=0.5,
+             size = 5) +
+  theme_bw() +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Sample type") +
+  labs(title = "B",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+ire_wp6_bray_time = data.scores %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "6A") %>%
+  filter(phase == "C0") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = timepoint)) +
+  geom_point(alpha=0.5,
+             size = 5) +
+  theme_bw() +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Time point") +
+  labs(title = "B",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))  
+
+ire_wp6_bray = ire_wp6_bray_samp + ire_wp6_bray_time
+
+ggsave("../plots/nmds_grouped/ire_bray_wp6.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/ire_bray_wp6.png", width = 10, height = 12)
+```
+Save
+```{r}
+# Sample groups
+ire_samp = ire_wp5_bray_samp / ire_wp6_bray_samp
+
+ggsave("../plots/nmds_grouped/ire_samp.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/ire_samp.png", width = 10, height = 12)
+
+# Time points
+ire_time = ire_wp5_bray_time / ire_wp6_bray_time
+
+ggsave("../plots/nmds_grouped/ire_time.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/ire_time.png", width = 10, height = 12)
+```
+
+
+## Norway
+### Phase c0 wp5
+```{r}
+nor_bray_c0_samp_wp5 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = sample_group,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Sample type") +
+  labs(title = "A",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+nor_bray_c0_time_wp5 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = timepoint, 
+             shape = type_sample,
+             size = shannon_entropy)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Time point") +
+  labs(title = "A",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))  
+
+nor_c0_pcoa = nor_bray_c0_samp_wp5 + nor_bray_c0_time_wp5
+
+ggsave("../plots/nmds_grouped/nor_bray_c0_wp5.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/nor_bray_c0_wp5.png", width = 10, height = 12)
+```
+
+### Phase c0 wp6
+```{r}
+nor_bray_c0_samp_wp6 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>%
+  filter(WP == "6A") %>%
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = sample_group,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Sample type") +
+  labs(title = "C",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+nor_bray_c0_time_wp6 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C0") %>%
+  filter(WP == "6A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = timepoint, 
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_color_manual(values = my_colors, name = "Time point") +
+  labs(title = "C",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))  
+
+nor_c0_pcoa_wp6 = nor_bray_c0_samp_wp6 / nor_bray_c0_time_wp6
+
+ggsave("../plots/nmds_grouped/nor_bray_c0_wp6.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/nor_bray_c0_wp6.png", width = 10, height = 12)
+```
+- Phase C1
+```{r}
+nor_bray_c1_samp_wp5 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C1") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = sample_group,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_size_continuous(name="Shannon Diversity") +
+  scale_color_manual(values = my_colors, name = "Sample type") +
+  labs(title = "B",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+nor_bray_c1_time_wp5 = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(phase == "C1") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = timepoint, 
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Source") +
+  scale_color_manual(values = my_colors, name = "Time point") +
+  labs(title = "B",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20))  
+
+nor_c1_pcoa = nor_bray_c1_samp_wp5 + nor_bray_c1_time_wp5
+
+ggsave("../plots/nmds_grouped/nor_bray_c1_wp5.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/nor_bray_c1_wp5.png", width = 10, height = 12)
+```
+Save
+```{r}
+# Sample groups
+nor_samp = nor_bray_c0_samp_wp5 / nor_bray_c1_samp_wp5 / nor_bray_c0_samp_wp6
+
+ggsave("../plots/nmds_grouped/nor_samp.pdf", width = 10, height = 16)
+ggsave("../plots/nmds_grouped/nor_samp.png", width = 10, height = 16)
+
+# Time points
+nor_time = nor_bray_c0_time_wp5 / nor_bray_c1_time_wp5 / nor_bray_c0_time_wp6
+
+ggsave("../plots/nmds_grouped/nor_time.pdf", width = 10, height = 16)
+ggsave("../plots/nmds_grouped/nor_time.png", width = 10, height = 16)
+```
+
+- Phase and WP
+```{r}
+nor_bray_phase = data.scores %>%
+  filter(country == "Norway") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = phase2)) +
+  geom_point(alpha=0.5,
+             size = 5) +
+  theme_bw() +
+  scale_color_discrete(name = "Phase") +
+  theme(text = element_text(size = 20)) +
+  labs(title = "A",
+       x = "NMDS1",
+       y = "NMDS2") +
+  stat_ellipse()
+
+nor_bray_wp = data.scores %>%
+  filter(country == "Norway") %>%
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = WP2)) +
+  geom_point(alpha=0.5,
+             size = 5) +
+  theme_bw() +
+  scale_color_discrete(name = "Work package") +
+  theme(text = element_text(size = 20)) +
+  labs(title = "B",
+       x = "NMDS1",
+       y = "NMDS2") +
+  stat_ellipse()
+
+nor_bray_wp_phases = nor_bray_phase / nor_bray_wp
+
+ggsave("../plots/nmds_grouped/nor_bray_phases_wp.pdf", width = 10, height = 12)
+ggsave("../plots/nmds_grouped/nor_bray_phases_wp.png", width = 10, height = 12)
+```
+- Countries and wp
+```{r}
+pcoa_country_wp = data.scores %>%
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = country,
+             shape = WP2)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_color_manual(values = c("brown3", "dodgerblue"), name="Country") +
+   scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Work Package") +
+  labs(title = "Sample sites and WP",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+ggsave("../plots/nmds_grouped/nmds_country_wp.pdf", width = 10, height = 6)
+ggsave("../plots/nmds_grouped/nmds_country_wp.png", width = 10, height = 6)
+```
+
+- countries and type of samples
+```{r}
+pcoa_country_wp = data.scores %>%
+  ggplot(aes(x = NMDS1, 
+             y = NMDS2, 
+             color = country,
+             shape = type_sample)) +
+  geom_point(alpha = 0.5,
+             size = 5) +
+  theme_bw() +
+  scale_color_manual(values = c("brown3", "dodgerblue"), name="Country") +
+   scale_shape_manual(values = c(15, 16, 17, 18, 9, 10, 21, 22, 11, 0, 5, 6),
+                     name="Type of sample") +
+  labs(title = "Sample sites and type",
+       x = "NMDS1",
+       y = "NMDS2") +
+  theme(text = element_text(size = 20)) +
+  stat_ellipse()
+
+ggsave("../plots/nmds_grouped/nmds_country_type.pdf", width = 10, height = 6)
+ggsave("../plots/nmds_grouped/nmds_country_type.png", width = 10, height = 6)
+```

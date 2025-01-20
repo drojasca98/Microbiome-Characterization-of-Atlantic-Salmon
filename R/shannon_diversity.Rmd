@@ -1,0 +1,238 @@
+---
+title: "Diversity analysis"
+author: "Dave Edison Rojas Calderon"
+date: "2023-04-11"
+output: html_document
+---
+
+Load packages
+```{r}
+library(qiime2R)
+library(tidyverse)
+library(gplots)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(janitor)
+library(patchwork)
+library(gridExtra)
+library(cowplot)
+library(ggpubr)
+```
+# Load data
+Metadata
+```{r}
+# Metadata table
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv") %>% 
+  mutate(phase2 = phase) %>% 
+  mutate(WP2 = WP)
+
+metadata = metadata %>% 
+  mutate(phase2 = str_replace(phase2, "C0", "Observation")) %>% 
+  mutate(phase2 = str_replace(phase2, "C1", "Intervention")) %>%
+  mutate(WP2 = str_replace(WP2, "6A", "Wild")) %>% 
+  mutate(WP2 = str_replace(WP2, "5A", "Farm")) %>% 
+  rename(index = SampleID)
+```
+Order levels to plot
+```{r}
+## Order the levels of samp_diminutive for plotting
+metadata$sample_dim = factor(metadata$sample_dim, levels = c("Fertilised eggs", "Yolk sack larvae", "Fry", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Filet", "Biofilm freshwater",  "Inlet water", "Tank water", "Outlet water", "Biofilm", "River water", "Upstream water to farm", "Seawater inside pen", "Seawater outside pen", "Feed freshwater", "Feed sea cage"))
+
+## Order time points for plotting
+metadata$timepoint= factor(metadata$timepoint, levels = c("T0", "T1", "T2", "T3", "T4", "T5", "T6","T7", "T8", "T9"))
+```
+For Alpha diversity (Shannon index)
+```{r}
+#Chao1 diversity
+shannon = read_qza("../data/salmon-5/core-metrics/shannon_vector.qza")
+## Row names to column called index
+shannon = shannon$data %>% 
+  rownames_to_column("index")
+
+#Join both tables
+meta_shannon = metadata %>% 
+  inner_join(shannon,
+            by = join_by(index))
+```
+# SHANNON
+```{r}
+my_colors = c("#E63946", "#F1FAEE", "#A8DADC", "#457B9D", "#1D3557",
+               "#FCA311", "#F4A261", "#E76F51", "#2A9D8F", "#264653",
+               "#FFD166", "#06D6A0", "#118AB2", "#073B4C", "#FFCDB2",
+               "#F95738", "#7B2D26", "#1B4332", "#BF1363", "#0B0C10",
+               "#F8F9FA", "#343A40", "#FFF8E6", "#FFD700", "#9A7197")
+```
+
+## Ireland
+### WP5
+```{r}
+ire_5a = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = timepoint,
+             y = shannon_entropy,
+             color = sample_dim)) +
+  geom_boxplot() +
+  labs(x = "Time point",
+       y = "Shannon index",
+       color = "Sample type") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(vars(sample_dim),
+             ncol = 5) +
+  theme(text = element_text(size = 20))
+```
+Save
+```{r}
+ggsave("../plots/shannon_diversity/ire_5a_shannon.png", width = 15, height = 8)
+ggsave("../plots/shannon_diversity/ire_5a_shannon.pdf", width = 15, height = 8)
+```
+
+### WP6
+```{r}
+ire_6a = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Ireland") %>%
+  filter(WP == "6A") %>% 
+  ggplot(aes(x = timepoint,
+             y = shannon_entropy,
+             color = sample_dim)) +
+  geom_boxplot() +
+  labs(x = "Time point",
+       y = "Shannon index",
+       color = "Sample type") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(vars(sample_dim),
+             ncol = 6,
+             nrow = 1) +
+  theme(text = element_text(size = 25))
+```
+Save
+```{r}
+ggsave("../plots/shannon_diversity/ire_6a_shannon.png", width = 20, height = 4)
+ggsave("../plots/shannon_diversity/ire_6a_shannon.pdf", width = 20, height = 4)
+```
+
+## NORWAY
+### 5A
+```{r}
+nor_5a = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Norway") %>%
+  filter(WP == "5A") %>% 
+  ggplot(aes(x = timepoint,
+             y = shannon_entropy,
+             color = phase2)) +
+  geom_boxplot() +
+  labs(x = "Time point",
+       y = "Shannon index",
+       color = "Phase") +
+  theme_bw() +
+  theme(legend.position = "right") +
+  facet_wrap(vars(sample_dim),
+             ncol = 6,
+             nrow = 3) +
+  theme(text = element_text(size = 22))
+```
+Save
+```{r}
+ggsave("../plots/shannon_diversity/nor_5a_shannon.png", width = 19, height = 7)
+ggsave("../plots/shannon_diversity/nor_5a_shannon.pdf", width = 19, height = 7)
+```
+
+### 6A
+```{r}
+nor_6a = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Norway") %>%
+  filter(WP == "6A") %>% 
+  ggplot(aes(x = timepoint,
+             y = shannon_entropy,
+             color = sample_dim)) +
+  geom_boxplot() +
+  labs(x = "Time point",
+       y = "Shannon index",
+       color = "Sample type") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(vars(sample_dim),
+             ncol = 3) +
+  theme(text = element_text(size = 22))
+```
+Save
+```{r}
+ggsave("../plots/shannon_diversity/nor_6a_shannon.png", width = 10, height = 7)
+ggsave("../plots/shannon_diversity/nor_6a_shannon.pdf", width = 10, height = 7)
+```
+
+## IRELAND: samples grouped
+```{r}
+ire_samp_wp = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Ireland") %>%
+  ggplot(aes(x = sample_dim,
+             y = shannon_entropy,
+             color = WP)) +
+  geom_boxplot() +
+  labs(x = "",
+       y = "Shannon index",
+       color = "Work package",
+       title = "A") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle=90, vjust=1, hjust=1)) +
+  theme(text = element_text(size = 17))
+```
+## Norway: samples grouped
+```{r}
+nor_samp_wp = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Norway") %>%
+  ggplot(aes(x = sample_dim,
+             y = shannon_entropy,
+             color = WP)) +
+  geom_boxplot() +
+  labs(x = "Sample type",
+       y = "Shannon index",
+       color = "Work package",
+       title = "B") +
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle=90, vjust=1, hjust=1)) +
+  theme(text = element_text(size = 17))
+```
+Save
+```{r}
+samp_wp = ire_samp_wp / nor_samp_wp + plot_layout(guides = "collect")
+
+ggsave("../plots/shannon_diversity/ire_nor_wp_shannon.pdf", width = 10, height = 12)
+ggsave("../plots/shannon_diversity/ire_nor_wp_shannon.png", width = 10, height = 12)
+```
+
+## Norway: samples grouped intervention vs observation
+```{r}
+nor_samp_phases = meta_shannon %>%
+  drop_na(shannon_entropy) %>%
+  filter(country == "Norway") %>%
+  filter(timepoint %in% c("T5", "T6", "T7", "T8")) %>% 
+  ggplot(aes(x = sample_dim,
+             y = shannon_entropy,
+             color = phase2)) +
+  geom_boxplot() +
+  labs(x = "Sample type",
+       y = "Shannon index",
+       color = "Phase",
+       title = "") +
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle=90, vjust=1, hjust=1)) +
+  theme(text = element_text(size = 17))
+
+ggsave("../plots/shannon_diversity/nor_samp_shannon.pdf", width = 10, height = 5)
+ggsave("../plots/shannon_diversity/nor_samp_shannon.png", width = 10, height = 5)
+```
+

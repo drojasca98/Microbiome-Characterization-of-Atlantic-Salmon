@@ -1,0 +1,1392 @@
+---
+title: "Upset plot"
+author: "Dave Edison Rojas Calderon"
+date: "2023-06-11"
+output: html_document
+---
+
+Load packages
+```{r}
+library(gplots)
+
+library(ggplot2)
+library(stringr)
+library(janitor)
+library(patchwork)
+library(gridExtra)
+library(cowplot)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+
+
+library(UpSetR)
+library(qiime2R)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+```
+
+# DATA WRANGLING
+```{r}
+# Open files: sequence variants (sv's), taxonomy, and metadata
+
+# set the working directory to where your files are located
+setwd("./")
+
+# SVs
+SVs = read_qza(file = "../data/salmon-5/table-atlanticsalmon-5.qza")
+
+# Taxonomy assignations
+taxonomy = read_qza(file = "../data/salmon-5/tax-class-atlanticsalmon-5.qza")
+
+# Metadata
+metadata = read_q2metadata("../data/salmon-5/metadata.tsv")
+colnames(metadata)[1] = "sample"
+metadata$sample = gsub("-", ".", metadata$sample)
+
+# Store the metadata dataframe
+save(metadata, file="metadata.Rda")
+
+# Clean memory
+gc()
+```
+Convert SVs and Taxonomy to table and clean taxonomy
+```{r}
+# SVs table
+SVs = SVs$data %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "Feature.ID")
+
+# Store the SVs dataframe
+save(SVs,file="SVs.Rda")
+
+# Taxonomy table
+taxonomy = taxonomy$data %>% 
+  parse_taxonomy() 
+
+# Clean up memory
+gc()
+
+# Clean up taxonomy
+# Remove instances of just underscores ()
+taxonomy[is.na(taxonomy)] = ""
+taxonomy[taxonomy == "__"] = ""
+
+for (i in 1:nrow(taxonomy)){
+  if (taxonomy[i,7] != ""){
+    taxonomy$Species[i] = paste(taxonomy$Genus[i], taxonomy$Species[i], sep = " ")
+  } else if (taxonomy[i,2] == ""){
+    kingdom = paste("Unclassified", taxonomy[i,1], sep = " ")
+    taxonomy[i, 2:7] = kingdom
+  } else if (taxonomy[i,3] == ""){
+    phylum = paste("Unclassified", taxonomy[i,2], sep = " ")
+    taxonomy[i, 3:7] = phylum
+  } else if (taxonomy[i,4] == ""){
+    class = paste("Unclassified", taxonomy[i,3], sep = " ")
+    taxonomy[i, 4:7] = class
+  } else if (taxonomy[i,5] == ""){
+    order = paste("Unclassified", taxonomy[i,4], sep = " ")
+    taxonomy[i, 5:7] = order
+  } else if (taxonomy[i,6] == ""){
+    family = paste("Unclassified", taxonomy[i,5], sep = " ")
+    taxonomy[i, 6:7] = family
+  } else if (taxonomy[i,7] == ""){
+    taxonomy$Species[i] = paste("Unclassified ",taxonomy$Genus[i], sep = " ")
+  }
+}
+
+# Add previous taxonomy level when "unclassified
+# Iterate over each row of the dataframe
+for (i in 1:nrow(taxonomy)) {
+  # Iterate over each column of the row
+  for (j in 1:ncol(taxonomy)) {
+    # Check if the value is "uncultured"
+    if (taxonomy[i, j] == "uncultured") {
+      # Update the value with "uncultured" followed by the previous column value
+      taxonomy[i, j] = paste0("uncultured ", taxonomy[i, j - 1])
+    }
+  }
+}
+
+# Remove Eukaryota
+taxonomy = taxonomy %>% 
+  filter(Kingdom != "d__Eukaryota") %>% 
+  filter(Kingdom != "Unassigned")
+
+# Store the taxonomy dataframe
+save(taxonomy,file="taxonomy.Rda")
+```
+Create Phylum table
+```{r}
+# This takes out only Phylum information from taxonomy, and joins it with
+# the SVs to create one data frame with tax annotated SVs
+Phylum = taxonomy %>% 
+  rownames_to_column(var = "Feature.ID") %>% 
+  select(Feature.ID, Phylum) %>% 
+  right_join(SVs,
+             by = "Feature.ID") %>% 
+  select(!Feature.ID) %>% 
+  drop_na() %>%
+  group_by(Phylum) %>% 
+  summarise_all(list(sum)) %>% 
+  pivot_longer(names_to = "sample",
+               values_to = "Count",
+               cols = -Phylum) %>% 
+  dplyr::select("sample", everything()) %>% 
+  mutate(Phylum = str_replace(Phylum,
+                              "Unclassified Unassigned",
+                              "Unassigned"))
+# Take out the trash
+gc()
+
+# Join with metadata
+Phylum = Phylum %>% 
+  left_join(metadata,
+            by = join_by(sample)) %>% 
+  rename(Taxonomy = Phylum)
+
+# Store the Phylum dataframe
+save(Phylum,file="Phylum.Rda")
+
+```
+Create Genus table 
+```{r}
+# This takes out only Genus information from taxonomy, and joins it with
+# the SVs to create one data frame with tax annotated SVs
+Genus = taxonomy %>% 
+  rownames_to_column(var = "Feature.ID") %>% 
+  select(Feature.ID, Genus) %>% 
+  right_join(SVs,
+             by = "Feature.ID") %>% 
+  select(!Feature.ID) %>% 
+  drop_na() %>%
+  group_by(Genus) %>% 
+  summarise_all(list(sum)) %>% 
+  pivot_longer(names_to = "sample",
+               values_to = "Count",
+               cols = -Genus) %>% 
+  dplyr::select("sample", everything()) %>% 
+  mutate(Genus = str_replace(Genus,
+                              "Unclassified Unassigned",
+                              "Unassigned"))
+# Take out the trash
+gc()
+
+# Join with metadata
+Genus = Genus %>% 
+  left_join(metadata,
+            by = join_by(sample)) %>% 
+  rename(Taxonomy = Genus)
+
+# Store the Phylum dataframe
+save(Genus,file="Genus.Rda")
+```
+# Functions
+Upset plot with minimum 1% abundance function
+```{r}
+abund_upset_plot = function(df, abudance_threshold, presence_threshold, output_file){
+
+  # Check if there are no samples left after filtering
+  if(nrow(df) == 0){
+    stop("Error: No samples left after filtering.")
+  }
+
+  # Calculate the total count for each sample
+  total_counts = df %>%
+    group_by(sample) %>%
+    summarise(total_count = sum(Count))
+
+  # Join the total_counts to the original dataframe
+  salmon = df %>%
+    left_join(total_counts, by = "sample")
+  
+  # Add a column for the percentage of total count
+  salmon = salmon %>%
+    mutate(percent_of_total = Count / total_count * 100)
+  
+  # Filter based on abundance_threshold
+  salmon = salmon %>%
+    filter(percent_of_total >= abudance_threshold)
+  
+  # Check if there are no phyla present at the given abundance threshold
+  if(nrow(salmon) == 0){
+    stop("Error: No phyla present at the given abundance threshold.")
+  }
+  
+    # Transform the data to a binary format (presence/absence)
+  salmon_binary = salmon %>% 
+    mutate(presence = ifelse(Count > 0, 1, 0)) %>% 
+    select(sample, Taxonomy, presence) %>% 
+    spread(key = Taxonomy, value = presence, fill = 0)
+  
+  # Calculate the percentage of samples each phylum is present in
+  presence_percentage = salmon_binary %>%
+    select(-sample) %>%
+    summarise(across(everything(), ~mean(. > 0)))
+  
+  # Get the phyla that meet the presence threshold
+  core_taxa = names(presence_percentage)[presence_percentage >= presence_threshold]
+  core_taxa = core_taxa[core_taxa != "Unassigned"]
+
+  # Filter to only include the core phyla
+  salmon_filtered = salmon_binary %>%
+    select(sample, all_of(core_taxa))
+  
+  # Save plots to pdf
+  outputdir = "../plots/upset/"
+  outfile = paste(outputdir, output_file, sep = "")
+  pdf(outfile, width = 10, height = 6)
+  
+  # Prepare your presence-absence dataframe
+  data_upset = salmon_filtered %>% 
+    column_to_rownames(var = "sample")
+
+  # Create the upset plot
+  print(upset(data_upset, sets = core_taxa,
+      sets.bar.color = "#56B4E9",
+      order.by = "freq",
+      nintersects = 60,
+      text.scale = c(1, 1, 1, 1, 0.75, 0.75),
+      point.size = 1.5))
+  
+  # Close the PDF file
+  dev.off()
+  
+  return(salmon_filtered)
+}
+```
+
+Function to save plot to pdf
+```{r}
+save_upset = function(df, output_file){
+  # Save plots to pdf
+  outputdir = "../plots/upset/"
+  outfile = paste(outputdir, output_file, sep = "")
+  pdf(outfile, width = 10, height = 6)
+
+  # Create the upset plot
+  print(upset(df,
+              sets.bar.color = "#56B4E9",
+              nsets = 60,
+              nintersects = 60))
+  
+  # Close the PDF file
+  dev.off()
+}
+```
+# PLOT
+Sets
+```{r}
+# Time points
+timepoints = c("T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8")
+timepoints_int = c("T5", "T6", "T7", "T8")
+river = c("T3", "T4", "T5")
+sea = c("T5", "T6", "T7")
+
+# Phases
+phases = c("Farm", "Wild")
+
+# Sample types
+fish = c("Fertilised eggs", "Yolk sack larvae", "Fry", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Filet")
+env = c("Biofilm", "Upstream water to farm", "Inlet water", "Tank water", "Outlet water", "River water", "Seawater inside pen", "Seawater outside pen", "Feed")
+all_types = c("Fertilised eggs", "Yolk sack larvae", "Fry", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Filet", "Biofilm", "Upstream water to farm", "Inlet water", "Tank water", "Outlet water", "River water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+# Lists of various sample types:
+digestas = c("Anterior digesta", "Mid digesta")
+intestines = c("Anterior intestine", "Mid intestine", "Posterior intestine")
+skin = c("Skin")
+int_skin = c("Skin", "Anterior intestine", "Mid intestine", "Posterior intestine")
+
+# Other
+fry = c("Fry")
+larvae = c("Yolk sack larvae")
+filet = c("Filet")
+eggs = c("Fertilized eggs")
+feed = c("Feed")
+waters = c("River water", "Upstream water to farm", "Inlet water", "Tank water", "Outlet water", "Sea water", "seawater inside pen", "Seawater outside pen")
+bioflm = c("Biofilm")
+```
+
+Norway to compare phases:
+Phylum
+```{r}
+int_phy = Phylum %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(sample_dim %in% fish)
+
+meta_int_phy_phase = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(type_sample == "Fish") %>%
+  filter(WP == "5A") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(sample_dim %in% int_skin) %>% 
+  select(sample, phase)
+
+phases_filtered = abund_upset_plot(int_phy, 1, 0.6, "upset_nor_phy_phases_abund.pdf")
+
+# PLOT Phases
+upset_data = as.data.frame(phases_filtered)
+upset_data = upset_data %>% 
+  inner_join(meta_int_phy_phase,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ phase, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(C0 = ifelse(C0 >= 1, 1, 0),
+         C1 = ifelse(C1 >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum") %>% 
+  rename(Intervention = `C1`) %>% 
+  rename(Observation = `C0`)
+
+int_phases = upset(grouped_to_plot)
+save_upset(grouped_to_plot, "nor_phy_phases.pdf")
+```
+Genus
+```{r}
+int_genus = Genus %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(sample_dim %in% fish)
+
+meta_int_phase = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(sample_dim %in% fish) %>% 
+  select(sample, phase)
+
+phases_filtered = abund_upset_plot(int_genus, 0.001, 0.6, "upset_nor_genus_phases_abund.pdf")
+
+# PLOT Phases
+upset_data = as.data.frame(phases_filtered)
+upset_data = upset_data %>% 
+  inner_join(meta_int_phase,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ phase, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(C0 = ifelse(C0 >= 1, 1, 0),
+         C1 = ifelse(C1 >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus") %>% 
+  rename(Intervention = `C1`) %>% 
+  rename(Observation = `C0`)
+
+int_phases = upset(grouped_to_plot)
+save_upset(grouped_to_plot, "nor_genus_phases.pdf")
+```
+
+
+Ireland fish farm and wild
+Phylum River
+```{r}
+ire_phy = Phylum %>% 
+  filter(country == "Ireland") %>% 
+  filter(sample_dim %in% int_skin) %>% 
+  filter(timepoint %in% river)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(sample_dim %in% int_skin) %>%
+  filter(timepoint %in% river) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_phy, 4.5, 0.6, "upset_ire_phy_wp_fish_river_abund.pdf")
+
+# Plot WP
+
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "ire_wp_phy_river_fish.pdf")
+```
+Genus
+```{r}
+ire_genus = Genus %>% 
+  filter(country == "Ireland") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(timepoint %in% river) %>% 
+  filter(sample_dim %in% int_skin)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(sample_dim %in% int_skin) %>%
+  filter(timepoint %in% river) %>% 
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_genus, 0.001, 0.6, "upset_ire_genus_wp_fish_abund.pdf")
+
+# Plot WP
+
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "ire_wp_fish.pdf")
+```
+Ireland fish farm and wild
+Phylum Sea
+```{r}
+ire_phy = Phylum %>% 
+  filter(country == "Ireland") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>% 
+  filter(timepoint %in% sea)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>%
+  filter(timepoint %in% sea) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_phy, 4.5, 0.6, "upset_ire_phy_wp_fish_sea_abund.pdf")
+
+# Plot WP
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "ire_wp_phy_sea_fish.pdf")
+```
+Genus Sea
+```{r}
+ire_gen = Genus %>% 
+  filter(country == "Ireland") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>% 
+  filter(timepoint %in% sea)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>%
+  filter(timepoint %in% sea) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_gen, 0.001, 0.6, "upset_ire_genus_wp_fish_sea_abund.pdf")
+
+# Plot WP
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "ire_wp_genus_sea_fish.pdf")
+```
+
+Ireland Farm Phylum
+```{r}
+ire_5a_phy = Phylum %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A")
+
+# To plot sample types
+meta_ire_5a_samp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_ire_5a_time = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, timepoint)
+
+ire_5a_filtered = abund_upset_plot(ire_5a_phy, 4.5, 0.6, "upset_ire_phy_5A_abund.pdf")
+
+# Plot Sample types
+upset_data = ire_5a_filtered %>% 
+  inner_join(meta_ire_5a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fertilised eggs` = ifelse(`Fertilised eggs` >= 1, 1, 0),
+         `Yolk sack larvae` = ifelse(`Yolk sack larvae` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `Inlet water` = ifelse(`Inlet water` >= 1, 1, 0),
+         `Tank water` = ifelse(`Tank water` >= 1, 1, 0),
+         `Seawater inside pen` = ifelse(`Seawater inside pen` >= 1, 1, 0),
+         `Seawater outside pen` = ifelse(`Seawater outside pen` >= 1, 1, 0),
+         `Feed freshwater` = ifelse(`Feed freshwater` >= 1, 1, 0),
+         `Feed sea cage` = ifelse(`Feed sea cage` >= 1, 1, 0))%>% 
+  column_to_rownames(var = "phylum")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "ire_5A_phy_samp.pdf")
+
+# Plot time points
+upset_data = ire_5a_filtered %>% 
+  inner_join(meta_ire_5a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T0` = ifelse(`T0` >= 1, 1, 0),
+         `T1` = ifelse(`T1` >= 1, 1, 0),
+         `T3` = ifelse(`T3` >= 1, 1, 0),
+         `T4` = ifelse(`T4` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0),
+         `T7` = ifelse(`T7` >= 1, 1, 0),
+         `T8` = ifelse(`T8` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+save_upset(grouped_to_plot, "ire_5A_phy_time.pdf")
+```
+Ireland farm genus
+```{r}
+ire_5a_genus = Genus %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A")
+
+# To plot sample types
+meta_ire_5a_samp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_ire_5a_time = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, timepoint)
+
+ire_5a_filtered = abund_upset_plot(ire_5a_genus, 0.001, 0.6, "upset_ire_genus_5A_abund.pdf")
+
+# Plot Sample types
+upset_data = ire_5a_filtered %>% 
+  inner_join(meta_ire_5a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fertilised eggs` = ifelse(`Fertilised eggs` >= 1, 1, 0),
+         `Yolk sack larvae` = ifelse(`Yolk sack larvae` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `Inlet water` = ifelse(`Inlet water` >= 1, 1, 0),
+         `Tank water` = ifelse(`Tank water` >= 1, 1, 0),
+         `Seawater inside pen` = ifelse(`Seawater inside pen` >= 1, 1, 0),
+         `Seawater outside pen` = ifelse(`Seawater outside pen` >= 1, 1, 0),
+         `Feed freshwater` = ifelse(`Feed freshwater` >= 1, 1, 0),
+         `Feed sea cage` = ifelse(`Feed sea cage` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "ire_5A_genus_samp.pdf")
+
+# Plot time points
+upset_data = ire_5a_filtered %>% 
+  inner_join(meta_ire_5a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T0` = ifelse(`T0` >= 1, 1, 0),
+         `T1` = ifelse(`T1` >= 1, 1, 0),
+         `T3` = ifelse(`T3` >= 1, 1, 0),
+         `T4` = ifelse(`T4` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0),
+         `T7` = ifelse(`T7` >= 1, 1, 0),
+         `T8` = ifelse(`T8` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+save_upset(grouped_to_plot, "ire_5A_genus_time.pdf")
+```
+Ireland wild phylum
+```{r}
+ire_6a_phy = Phylum %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A")
+
+# To plot sample types
+meta_ire_6a_samp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_ire_6a_time = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, timepoint)
+
+ire_6a_filtered = abund_upset_plot(ire_6a_phy, 4.5, 0.6, "upset_ire_phy_6A_abund.pdf")
+
+# Plot Sample types
+upset_data = ire_6a_filtered %>% 
+  inner_join(meta_ire_6a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+# Order columns
+#col_order = c("Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "ire_6A_phy_samp.pdf")
+
+# Plot time points
+upset_data = ire_6a_filtered %>% 
+  inner_join(meta_ire_6a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T3` = ifelse(`T3` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+save_upset(grouped_to_plot, "ire_6A_phy_time.pdf")
+```
+Ireland Wild genus
+```{r}
+ire_6a_genus = Genus %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A")
+
+# To plot sample types
+meta_ire_6a_samp = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_ire_6a_time = metadata %>% 
+  filter(country == "Ireland") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, timepoint)
+
+ire_6a_filtered = abund_upset_plot(ire_6a_genus, 0.001, 0.6, "upset_ire_genus_6A_abund.pdf")
+
+# Plot Sample types
+upset_data = ire_6a_filtered %>% 
+  inner_join(meta_ire_6a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+# Order columns
+col_order = c("Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta")
+
+grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "ire_6A_genus_samp.pdf")
+
+# Plot time points
+upset_data = ire_6a_filtered %>% 
+  inner_join(meta_ire_6a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T3` = ifelse(`T3` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+save_upset(grouped_to_plot, "ire_6A_genus_time.pdf")
+```
+Norway Farm phylum
+```{r}
+nor_5a_phy = Phylum %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A")
+
+# To plot sample types
+meta_nor_5a_samp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_nor_5a_time = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, timepoint)
+
+nor_5a_filtered = abund_upset_plot(nor_5a_phy, 4.5, 0.6, "upset_nor_phy_5A_abund.pdf")
+
+# Plot Sample types
+upset_data = nor_5a_filtered %>% 
+  inner_join(meta_nor_5a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fertilised eggs` = ifelse(`Fertilised eggs` >= 1, 1, 0),
+         `Yolk sack larvae` = ifelse(`Yolk sack larvae` >= 1, 1, 0),
+         `Fry` = ifelse(`Fry` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Filet` = ifelse(`Filet` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `Inlet water` = ifelse(`Inlet water` >= 1, 1, 0),
+         `Outlet water` = ifelse(`Outlet water` >= 1, 1, 0),
+         `Tank water` = ifelse(`Tank water` >= 1, 1, 0),
+         `Upstream water to farm` = ifelse(`Upstream water to farm` >= 1, 1, 0),
+         `Seawater inside pen` = ifelse(`Seawater inside pen` >= 1, 1, 0),
+         `Feed freshwater` = ifelse(`Feed freshwater` >= 1, 1, 0),
+         `Feed sea cage` = ifelse(`Feed sea cage` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = lapply(grouped_to_plot, as.numeric)
+
+save_upset(grouped_to_plot, "nor_5A_phy_samp.pdf")
+
+# Plot time points
+upset_data = nor_5a_filtered %>% 
+  inner_join(meta_nor_5a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T0` = ifelse(`T0` >= 1, 1, 0),
+         `T1` = ifelse(`T1` >= 1, 1, 0),
+         `T2` = ifelse(`T2` >= 1, 1, 0),
+         `T4` = ifelse(`T4` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0),
+         `T7` = ifelse(`T7` >= 1, 1, 0),
+         `T8` = ifelse(`T8` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+save_upset(grouped_to_plot, "nor_5A_phy_time.pdf")
+```
+Norway Farm genus
+```{r}
+nor_5a_genus = Genus %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A")
+
+# To plot sample types
+meta_nor_5a_samp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_nor_5a_time = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "5A") %>% 
+  select(sample, timepoint)
+
+nor_5a_filtered = abund_upset_plot(nor_5a_genus, 0.001, 0.6, "upset_nor_genus_5A_abund.pdf")
+
+# Plot Sample types
+upset_data = nor_5a_filtered %>% 
+  inner_join(meta_nor_5a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fertilised eggs` = ifelse(`Fertilised eggs` >= 1, 1, 0),
+         `Yolk sack larvae` = ifelse(`Yolk sack larvae` >= 1, 1, 0),
+         `Fry` = ifelse(`Fry` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Filet` = ifelse(`Filet` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `Inlet water` = ifelse(`Inlet water` >= 1, 1, 0),
+         `Outlet water` = ifelse(`Outlet water` >= 1, 1, 0),
+         `Tank water` = ifelse(`Tank water` >= 1, 1, 0),
+         `Upstream water to farm` = ifelse(`Upstream water to farm` >= 1, 1, 0),
+         `Seawater inside pen` = ifelse(`Seawater inside pen` >= 1, 1, 0),
+         `Feed freshwater` = ifelse(`Feed freshwater` >= 1, 1, 0),
+         `Feed sea cage` = ifelse(`Feed sea cage` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "nor_5A_genus_samp.pdf")
+
+# Plot time points
+upset_data = nor_5a_filtered %>% 
+  inner_join(meta_nor_5a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T0` = ifelse(`T0` >= 1, 1, 0),
+         `T1` = ifelse(`T1` >= 1, 1, 0),
+         `T2` = ifelse(`T2` >= 1, 1, 0),
+         `T4` = ifelse(`T4` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0),
+         `T7` = ifelse(`T7` >= 1, 1, 0),
+         `T8` = ifelse(`T8` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+save_upset(grouped_to_plot, "nor_5A_genus_time.pdf")
+```
+Norway Wild phylum
+```{r}
+nor_6a_phy = Phylum %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A")
+
+# To plot sample types
+meta_nor_6a_samp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_nor_6a_time = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, timepoint)
+
+nor_6a_filtered = abund_upset_plot(nor_6a_phy, 4.5, 0.6, "upset_nor_phy_6A_abund.pdf")
+
+# Plot Sample types
+upset_data = nor_6a_filtered %>% 
+  inner_join(meta_nor_6a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fry` = ifelse(`Fry` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `River water` = ifelse(`River water` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "nor_6A_phy_samp.pdf")
+
+# Plot time points
+upset_data = nor_6a_filtered %>% 
+  inner_join(meta_nor_6a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T2` = ifelse(`T2` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum")
+
+save_upset(grouped_to_plot, "nor_6A_phy_time.pdf")
+```
+Norway Wild genus
+```{r}
+nor_6a_genus = Genus %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A")
+
+# To plot sample types
+meta_nor_6a_samp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, sample_dim)
+
+# To plot time points
+meta_nor_6a_time = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(WP == "6A") %>% 
+  select(sample, timepoint)
+
+nor_6a_filtered = abund_upset_plot(nor_6a_genus, 0.001, 0.6, "upset_nor_genus_6A_abund.pdf")
+
+# Plot Sample types
+upset_data = nor_6a_filtered %>% 
+  inner_join(meta_nor_6a_samp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ sample_dim, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`Fry` = ifelse(`Fry` >= 1, 1, 0),
+         `Skin` = ifelse(`Skin` >= 1, 1, 0),
+         `Anterior intestine` = ifelse(`Anterior intestine` >= 1, 1, 0),
+         `Mid intestine` = ifelse(`Mid intestine` >= 1, 1, 0),
+         `Posterior intestine` = ifelse(`Posterior intestine` >= 1, 1, 0),
+         `Anterior digesta` = ifelse(`Anterior digesta` >= 1, 1, 0),
+         `Mid digesta` = ifelse(`Mid digesta` >= 1, 1, 0),
+         `Biofilm` = ifelse(`Biofilm` >= 1, 1, 0),
+         `River water` = ifelse(`River water` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+# Order columns
+#col_order = c("Fertilised eggs", "Yolk sack larvae", "Skin", "Anterior intestine", "Mid intestine", "Posterior intestine", "Anterior digesta", "Mid digesta", "Biofilm", "Inlet water", "Tank water", "Seawater inside pen", "Seawater outside pen", "Feed")
+
+#grouped_to_plot = grouped_to_plot[, col_order]
+
+save_upset(grouped_to_plot, "nor_6A_genus_samp.pdf")
+
+# Plot time points
+upset_data = nor_6a_filtered %>% 
+  inner_join(meta_nor_6a_time,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ timepoint, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`T2` = ifelse(`T2` >= 1, 1, 0),
+         `T5` = ifelse(`T5` >= 1, 1, 0),
+         `T6` = ifelse(`T6` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus")
+
+save_upset(grouped_to_plot, "nor_6A_genus_time.pdf")
+```
+
+Norway fish farm and wild
+Phylum River
+```{r}
+ire_phy = Phylum %>% 
+  filter(country == "Norway") %>% 
+  filter(sample_dim %in% int_skin) %>% 
+  filter(timepoint %in% river)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(sample_dim %in% int_skin) %>%
+  filter(timepoint %in% river) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_phy, 4.5, 0.6, "upset_nor_phy_wp_fish_river_abund.pdf")
+
+# Plot WP
+
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "nor_wp_phy_river_fish.pdf")
+```
+Genus
+```{r}
+ire_genus = Genus %>% 
+  filter(country == "Norway") %>% 
+  filter(timepoint %in% timepoints_int) %>% 
+  filter(timepoint %in% river) %>% 
+  filter(sample_dim %in% int_skin)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(sample_dim %in% int_skin) %>%
+  filter(timepoint %in% river) %>% 
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_genus, 0.001, 0.6, "upset_nor_genus_wp_fish_abund.pdf")
+
+# Plot WP
+
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "nor_wp_fish.pdf")
+```
+
+Norway fish farm and wild
+Phylum Sea
+```{r}
+ire_phy = Phylum %>% 
+  filter(country == "Norway") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>% 
+  filter(timepoint %in% sea)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>%
+  filter(timepoint %in% sea) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_phy, 4.5, 0.6, "upset_nor_phy_wp_fish_sea_abund.pdf")
+
+# Plot WP
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(phylum = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "phylum") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "nor_wp_phy_sea_fish.pdf")
+```
+
+Genus Sea
+```{r}
+ire_gen = Genus %>% 
+  filter(country == "Norway") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>% 
+  filter(timepoint %in% sea)
+
+meta_ire_wp = metadata %>% 
+  filter(country == "Norway") %>% 
+  filter(type_sample == "Fish") %>% 
+  filter(sample_dim %in% fish) %>%
+  filter(timepoint %in% sea) %>%
+  select(sample, WP)
+
+ire_filtered = abund_upset_plot(ire_gen, 0.001, 0.6, "upset_nor_genus_wp_fish_sea_abund.pdf")
+
+# Plot WP
+upset_data = ire_filtered %>% 
+  inner_join(meta_ire_wp,
+             by = "sample") %>% 
+  select(-c(sample)) # Exclude non-genus columns
+
+grouped_data = aggregate(. ~ WP, data = upset_data, FUN = sum)
+
+grouped_data_t = t(grouped_data) %>% 
+  row_to_names(row_number = 1) %>% 
+  as.matrix()
+
+grouped_data_t = data.frame(genus = row.names(grouped_data_t), grouped_data_t, check.names = FALSE)
+    
+grouped_to_plot = grouped_data_t %>%
+  as_tibble() %>% 
+  mutate(`5A` = ifelse(`5A` >= 1, 1, 0),
+         `6A` = ifelse(`6A` >= 1, 1, 0)) %>% 
+  column_to_rownames(var = "genus") %>% 
+  rename(Farm = `5A`) %>% 
+  rename(Wild = `6A`)
+
+save_upset(grouped_to_plot, "nor_wp_genus_sea_fish.pdf")
+```
